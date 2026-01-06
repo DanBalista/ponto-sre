@@ -1,0 +1,825 @@
+from flask import Flask, request, jsonify, send_from_directory, render_template, send_file
+from flask_cors import CORS
+import os
+import bcrypt
+import jwt
+import datetime
+import pytz
+from functools import wraps
+import sqlite3
+from dotenv import load_dotenv
+import openpyxl
+from io import BytesIO
+
+load_dotenv()
+
+app = Flask(__name__, static_folder='static', template_folder='templates')
+_secret = os.getenv('SECRET_KEY')
+if not _secret:
+    _secret = os.getenv('DB_PASSWORD', 'ponto_sre_carapina')
+app.config['SECRET_KEY'] = _secret
+try:
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+except Exception:
+    pass
+
+# Database Configuration
+server = os.getenv('DB_SERVER')
+database = os.getenv('DB_NAME')
+username = os.getenv('DB_USER')
+password = os.getenv('DB_PASSWORD')
+sqlite_path = os.getenv('SQLITE_PATH', 'local.db')
+USE_SQLITE = False
+
+# Optional: initialize database/tables on startup when deploying
+if os.getenv('INIT_DB_ON_START', 'false').lower() == 'true':
+    try:
+        from setup_db import create_database, create_tables
+        create_database()
+        create_tables()
+    except Exception:
+        pass
+
+def ensure_sqlite_schema(conn):
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS Users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            matricula TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            name TEXT NOT NULL,
+            role TEXT DEFAULT 'user'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS TimeRecords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            record_type TEXT NOT NULL,
+            timestamp DATETIME,
+            neighborhood TEXT,
+            city TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS OfflineQueue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            record_type TEXT NOT NULL,
+            timestamp DATETIME,
+            neighborhood TEXT,
+            city TEXT
+        )
+    """)
+    conn.commit()
+
+def ensure_default_admin():
+    try:
+        admin_mat = os.getenv('ADMIN_MATRICULA', 'admin')
+        admin_pass = os.getenv('ADMIN_PASSWORD', 'admin')
+        admin_name = os.getenv('ADMIN_NAME', 'Administrador')
+        sconn = sqlite3.connect(sqlite_path)
+        sconn.row_factory = sqlite3.Row
+        ensure_sqlite_schema(sconn)
+        scur = sconn.cursor()
+        scur.execute("SELECT 1 FROM Users WHERE matricula = ?", (admin_mat,))
+        exists = scur.fetchone()
+        if not exists:
+            hashed = bcrypt.hashpw(admin_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            try:
+                scur.execute("INSERT OR IGNORE INTO Users (matricula, password, name, role) VALUES (?, ?, ?, ?)", (admin_mat, hashed, admin_name, 'admin'))
+                sconn.commit()
+            except Exception:
+                pass
+        sconn.close()
+    except Exception:
+        pass
+
+def sql_online():
+    try:
+        import pyodbc
+        drivers = [d for d in pyodbc.drivers() if 'SQL Server' in d]
+        driver = drivers[0] if drivers else 'ODBC Driver 17 for SQL Server'
+        conn_str = f'DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={password};TrustServerCertificate=yes;Connection Timeout=2'
+        pyodbc.connect(conn_str).close()
+        return True
+    except Exception:
+        return False
+
+def get_db_connection():
+    global USE_SQLITE
+    if sql_online():
+        try:
+            USE_SQLITE = False
+            import pyodbc
+            drivers = [d for d in pyodbc.drivers() if 'SQL Server' in d]
+            driver = drivers[0] if drivers else 'ODBC Driver 17 for SQL Server'
+            conn_str = f'DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={password};TrustServerCertificate=yes;Connection Timeout=2'
+            return pyodbc.connect(conn_str)
+        except Exception:
+            pass
+    USE_SQLITE = True
+    conn = sqlite3.connect(sqlite_path)
+    conn.row_factory = sqlite3.Row
+    ensure_sqlite_schema(conn)
+    return conn
+
+def rf(row, name):
+    try:
+        return row[name]
+    except Exception:
+        return getattr(row, name)
+
+# Auth Decorator
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("Authorization", "") or ""
+        parts = auth.split()
+        token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else None
+        if not token:
+            return jsonify({"message": "Token is missing!"}), 401
+        try:
+            data = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+            current_user_id = data["user_id"]
+            role = data["role"]
+        except Exception:
+            return jsonify({"message": "Token is invalid!"}), 401
+        return f(current_user_id, role, *args, **kwargs)
+    return decorated
+
+# Routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'}), 200
+
+@app.route('/register')
+def register_page():
+    return render_template('register.html')
+
+@app.route('/dashboard')
+def dashboard():
+    return render_template('dashboard.html')
+
+@app.route('/admin')
+def admin_page():
+    return render_template('admin.html')
+
+# API Endpoints
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    hashed_password = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("INSERT INTO Users (matricula, password, name, role) VALUES (?, ?, ?, ?)",
+                       (data['matricula'], hashed_password, data['name'], 'user'))
+        conn.commit()
+        # mirror to local sqlite for offline login
+        try:
+            sconn = sqlite3.connect(sqlite_path)
+            sconn.row_factory = sqlite3.Row
+            ensure_sqlite_schema(sconn)
+            scur = sconn.cursor()
+            scur.execute("INSERT OR IGNORE INTO Users (matricula, password, name, role) VALUES (?, ?, ?, ?)",
+                         (data['matricula'], hashed_password, data['name'], 'user'))
+            sconn.commit()
+            sconn.close()
+        except Exception:
+            pass
+        return jsonify({'message': 'User registered successfully!'}), 201
+    except Exception as e:
+        msg = str(e)
+        if 'UNIQUE' in msg or 'unique' in msg or 'duplicate' in msg:
+            return jsonify({'message': 'Matricula already exists!'}), 409
+        return jsonify({'message': msg}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    user = None
+    try:
+        cursor.execute("SELECT id, password, name, role FROM Users WHERE matricula = ?", (data['matricula'],))
+        user = cursor.fetchone()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    # if user not found and SQL is online, fallback check in sqlite
+    if not user and not USE_SQLITE:
+        try:
+            sconn = sqlite3.connect(sqlite_path)
+            sconn.row_factory = sqlite3.Row
+            ensure_sqlite_schema(sconn)
+            scur = sconn.cursor()
+            scur.execute("SELECT id, password, name, role FROM Users WHERE matricula = ?", (data['matricula'],))
+            user = scur.fetchone()
+            sconn.close()
+        except Exception:
+            user = None
+    try:
+        conn.close()
+    except Exception:
+        pass
+    
+    if user and bcrypt.checkpw(data['password'].encode('utf-8'), rf(user, 'password').encode('utf-8')):
+        token = jwt.encode({
+            'user_id': rf(user, 'id'),
+            'role': rf(user, 'role'),
+            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        }, app.config['SECRET_KEY'], algorithm="HS256")
+        
+        return jsonify({'token': token, 'role': rf(user, 'role'), 'name': rf(user, 'name')})
+    
+    return jsonify({'message': 'Invalid credentials!'}), 401
+
+@app.route('/api/punch', methods=['POST'])
+@token_required
+def punch(current_user_id, role):
+    data = request.get_json()
+    # Expecting: type, neighborhood, city
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    br_tz = pytz.timezone('America/Sao_Paulo')
+    current_time = datetime.datetime.now(br_tz).replace(tzinfo=None)
+    # Fetch user info to store denormalized fields when available
+    try:
+        cursor.execute("SELECT matricula, name FROM Users WHERE id = ?", (current_user_id,))
+        u = cursor.fetchone()
+        user_matricula = rf(u, 'matricula') if u else None
+        user_name = rf(u, 'name') if u else None
+    except Exception:
+        user_matricula = None
+        user_name = None
+
+    # Insert depending on availability
+    online = sql_online() and not USE_SQLITE
+    if online:
+        try:
+            cursor.execute(
+                """
+                INSERT INTO TimeRecords (user_id, matricula, user_name, record_type, neighborhood, city, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (current_user_id, user_matricula, user_name, data['type'], data.get('neighborhood'), data.get('city'), current_time)
+            )
+        except Exception:
+            cursor.execute(
+                """
+                INSERT INTO TimeRecords (user_id, record_type, neighborhood, city, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (current_user_id, data['type'], data.get('neighborhood'), data.get('city'), current_time)
+            )
+    else:
+        qconn = sqlite3.connect(sqlite_path)
+        qconn.row_factory = sqlite3.Row
+        ensure_sqlite_schema(qconn)
+        qcur = qconn.cursor()
+        try:
+            qcur.execute(
+                """
+                INSERT INTO OfflineQueue (user_id, record_type, neighborhood, city, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (current_user_id, data['type'], data.get('neighborhood'), data.get('city'), current_time)
+            )
+            qconn.commit()
+        finally:
+            qconn.close()
+
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'message': 'Ponto recorded successfully!'}), 201
+
+@app.route('/api/history', methods=['GET'])
+@token_required
+def history(current_user_id, role):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT record_type, timestamp, neighborhood, city 
+        FROM TimeRecords 
+        WHERE user_id = ? 
+        ORDER BY timestamp DESC
+    """, (current_user_id,))
+    
+    records = []
+    seen = set()
+    for row in cursor.fetchall():
+        ts = rf(row, 'timestamp')
+        if isinstance(ts, datetime.datetime):
+            ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+        key = (rf(row, 'record_type'), ts)
+        seen.add(key)
+        records.append({
+            'type': rf(row, 'record_type'),
+            'timestamp': ts,
+            'neighborhood': rf(row, 'neighborhood'),
+            'city': rf(row, 'city'),
+            'pending': False
+        })
+    # Append offline queued items
+    try:
+        sconn = sqlite3.connect(sqlite_path)
+        sconn.row_factory = sqlite3.Row
+        ensure_sqlite_schema(sconn)
+        scur = sconn.cursor()
+        scur.execute("SELECT record_type, timestamp, neighborhood, city FROM OfflineQueue WHERE user_id = ? ORDER BY timestamp DESC", (current_user_id,))
+        for row in scur.fetchall():
+            ts = rf(row, 'timestamp')
+            if isinstance(ts, datetime.datetime):
+                ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+            records.append({
+                'type': rf(row, 'record_type'),
+                'timestamp': ts,
+                'neighborhood': rf(row, 'neighborhood'),
+                'city': rf(row, 'city'),
+                'pending': True
+            })
+        # also include sqlite TimeRecords not present in SQL (pending legacy)
+        try:
+            scur.execute("SELECT record_type, timestamp, neighborhood, city FROM TimeRecords WHERE user_id = ? ORDER BY timestamp DESC", (current_user_id,))
+            for row in scur.fetchall():
+                ts = rf(row, 'timestamp')
+                if isinstance(ts, datetime.datetime):
+                    ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+                key = (rf(row, 'record_type'), ts)
+                if key not in seen:
+                    records.append({
+                        'type': rf(row, 'record_type'),
+                        'timestamp': ts,
+                        'neighborhood': rf(row, 'neighborhood'),
+                        'city': rf(row, 'city'),
+                        'pending': True
+                    })
+        except Exception:
+            pass
+        sconn.close()
+    except Exception:
+        pass
+    conn.close()
+    return jsonify(records)
+
+@app.route('/api/online')
+def online():
+    forced = os.getenv('FORCE_ONLINE', 'false').lower() == 'true'
+    simulate = os.getenv('SIMULATE_SYNC', 'false').lower() == 'true'
+    return jsonify({'online': forced or simulate or sql_online()}), 200
+
+@app.route('/api/user/report', methods=['GET'])
+@token_required
+def user_report(current_user_id, role):
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    base = """
+        SELECT COALESCE(t.matricula, u.matricula) AS matricula,
+               COALESCE(t.user_name, u.name) AS name,
+               t.record_type, t.timestamp, t.neighborhood, t.city
+        FROM TimeRecords t
+        LEFT JOIN Users u ON t.user_id = u.id
+        WHERE t.user_id = ?
+    """
+    params = [current_user_id]
+    if start_date:
+        base += " AND CONVERT(date, t.timestamp) >= ?"
+        params.append(start_date)
+    if end_date:
+        base += " AND CONVERT(date, t.timestamp) <= ?"
+        params.append(end_date)
+    base += " ORDER BY t.timestamp DESC"
+    cursor.execute(base, params)
+    rows = cursor.fetchall()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Meus Registros"
+    ws.append(["Matricula", "Nome", "Tipo", "Data/Hora", "Bairro", "Cidade"])
+    for row in rows:
+        ts = rf(row, 'timestamp')
+        ws.append([
+            rf(row, 'matricula'),
+            rf(row, 'name'),
+            rf(row, 'record_type'),
+            ts,
+            rf(row, 'neighborhood'),
+            rf(row, 'city')
+        ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    conn.close()
+    return send_file(output, download_name="meus_registros.xlsx", as_attachment=True)
+
+@app.route('/api/admin/users', methods=['GET'])
+@token_required
+def get_users(current_user_id, role):
+    if role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, matricula, name, role FROM Users")
+    users = [{'id': rf(row, 'id'), 'matricula': rf(row, 'matricula'), 'name': rf(row, 'name'), 'role': rf(row, 'role')} for row in cursor.fetchall()]
+    conn.close()
+    return jsonify(users)
+
+@app.route('/api/admin/users', methods=['POST'])
+@token_required
+def create_user(current_user_id, role):
+    if role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    data = request.get_json()
+    matricula = data.get('matricula')
+    name = data.get('name')
+    password_raw = data.get('password')
+    new_role = data.get('role', 'user')
+    if not matricula or not name or not password_raw:
+        return jsonify({'message': 'Dados obrigatórios faltando'}), 400
+    hashed = bcrypt.hashpw(password_raw.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO Users (matricula, password, name, role) VALUES (?, ?, ?, ?)", (matricula, hashed, name, new_role))
+        conn.commit()
+        # mirror to local sqlite for offline availability
+        try:
+            sconn = sqlite3.connect(sqlite_path)
+            sconn.row_factory = sqlite3.Row
+            ensure_sqlite_schema(sconn)
+            scur = sconn.cursor()
+            scur.execute("INSERT OR IGNORE INTO Users (matricula, password, name, role) VALUES (?, ?, ?, ?)", (matricula, hashed, name, new_role))
+            sconn.commit()
+            sconn.close()
+        except Exception:
+            pass
+        return jsonify({'message': 'Usuário criado'}), 201
+    except Exception as e:
+        msg = str(e)
+        if 'UNIQUE' in msg or 'duplicate' in msg:
+            return jsonify({'message': 'Matrícula já existe'}), 409
+        return jsonify({'message': msg}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/users/<int:user_id>', methods=['PUT'])
+@token_required
+def update_user(current_user_id, role, user_id):
+    if role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    data = request.get_json()
+    fields = []
+    values = []
+    if 'matricula' in data and data['matricula']:
+        fields.append('matricula = ?')
+        values.append(data['matricula'])
+    if 'name' in data and data['name']:
+        fields.append('name = ?')
+        values.append(data['name'])
+    if 'role' in data and data['role']:
+        fields.append('role = ?')
+        values.append(data['role'])
+    if 'password' in data and data['password']:
+        hashed = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        fields.append('password = ?')
+        values.append(hashed)
+    if not fields:
+        return jsonify({'message': 'Nada para atualizar'}), 400
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        query = f"UPDATE Users SET {', '.join(fields)} WHERE id = ?"
+        values.append(user_id)
+        cursor.execute(query, tuple(values))
+        conn.commit()
+        # mirror basic fields into local sqlite when possible
+        try:
+            sconn = sqlite3.connect(sqlite_path)
+            sconn.row_factory = sqlite3.Row
+            ensure_sqlite_schema(sconn)
+            scur = sconn.cursor()
+            # fetch matricula for local key
+            cursor.execute("SELECT matricula FROM Users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+            mat = rf(row, 'matricula') if row else None
+            if mat:
+                set_parts = []
+                upd_vals = []
+                if 'name' in data and data['name']:
+                    set_parts.append('name = ?'); upd_vals.append(data['name'])
+                if 'role' in data and data['role']:
+                    set_parts.append('role = ?'); upd_vals.append(data['role'])
+                if 'password' in data and data['password']:
+                    set_parts.append('password = ?'); upd_vals.append(values[-2] if len(values) >= 2 else None)
+                if set_parts:
+                    upd_vals.append(mat)
+                    scur.execute(f"UPDATE Users SET {', '.join(set_parts)} WHERE matricula = ?", tuple(upd_vals))
+                    sconn.commit()
+            sconn.close()
+        except Exception:
+            pass
+        return jsonify({'message': 'Usuário atualizado'}), 200
+    except Exception as e:
+        msg = str(e)
+        if 'UNIQUE' in msg or 'duplicate' in msg:
+            return jsonify({'message': 'Matrícula já existe'}), 409
+        return jsonify({'message': msg}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+@token_required
+def delete_user(current_user_id, role, user_id):
+    if role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        try:
+            cursor.execute("DELETE FROM TimeRecords WHERE user_id = ?", (user_id,))
+        except Exception:
+            pass
+        cursor.execute("DELETE FROM Users WHERE id = ?", (user_id,))
+        conn.commit()
+        # mirror delete in local sqlite
+        try:
+            sconn = sqlite3.connect(sqlite_path)
+            sconn.row_factory = sqlite3.Row
+            ensure_sqlite_schema(sconn)
+            scur = sconn.cursor()
+            # try to delete by matricula
+            try:
+                cursor.execute("SELECT matricula FROM Users WHERE id = ?", (user_id,))
+                row = cursor.fetchone()
+                mat = rf(row, 'matricula') if row else None
+            except Exception:
+                mat = None
+            if mat:
+                scur.execute("DELETE FROM Users WHERE matricula = ?", (mat,))
+            sconn.commit()
+            sconn.close()
+        except Exception:
+            pass
+        return jsonify({'message': 'Usuário excluído'}), 200
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/admin/report', methods=['GET'])
+@token_required
+def generate_report(current_user_id, role):
+    if role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    
+    target_user_id = request.args.get('user_id')
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    query = """
+        SELECT COALESCE(t.matricula, u.matricula) AS matricula,
+               COALESCE(t.user_name, u.name) AS name,
+               t.record_type, t.timestamp, t.neighborhood, t.city
+        FROM TimeRecords t
+        LEFT JOIN Users u ON t.user_id = u.id
+    """
+    params = []
+    
+    if target_user_id:
+        query += " WHERE u.id = ?"
+        params.append(target_user_id)
+        
+    query += " ORDER BY t.timestamp DESC"
+    
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    wb = openpyxl.Workbook()
+    if target_user_id:
+        ws = wb.active
+        ws.title = "Relatorio Ponto"
+        ws.append(["Matricula", "Nome", "Tipo", "Data/Hora", "Bairro", "Cidade"])
+        for row in rows:
+            ts = rf(row, 'timestamp')
+            ws.append([
+                rf(row, 'matricula'),
+                rf(row, 'name'),
+                rf(row, 'record_type'),
+                ts,
+                rf(row, 'neighborhood'),
+                rf(row, 'city')
+            ])
+    else:
+        wb.remove(wb.active)
+        groups = {}
+        for row in rows:
+            key = (rf(row, 'matricula'), rf(row, 'name'))
+            groups.setdefault(key, []).append(row)
+        for (matricula, name), items in groups.items():
+            title = name or matricula or "Usuario"
+            title = str(title)[:31]
+            for ch in [":", "*", "?", "/", "\\", "[", "]"]:
+                title = title.replace(ch, "-")
+            ws = wb.create_sheet(title=title)
+            ws.append(["Matricula", "Nome", "Tipo", "Data/Hora", "Bairro", "Cidade"])
+            for row in items:
+                ts = rf(row, 'timestamp')
+                ws.append([
+                    rf(row, 'matricula'),
+                    rf(row, 'name'),
+                    rf(row, 'record_type'),
+                    ts,
+                    rf(row, 'neighborhood'),
+                    rf(row, 'city')
+                ])
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    conn.close()
+    return send_file(output, download_name="meus_registros.xlsx", as_attachment=True)
+
+@app.route('/api/sync', methods=['POST'])
+@token_required
+def sync_now(current_user_id, role):
+    forced = os.getenv('FORCE_ONLINE', 'false').lower() == 'true'
+    simulate = os.getenv('SIMULATE_SYNC', 'false').lower() == 'true'
+    if simulate:
+        try:
+            sconn = sqlite3.connect(sqlite_path)
+            sconn.row_factory = sqlite3.Row
+            ensure_sqlite_schema(sconn)
+            scur = sconn.cursor()
+            scur.execute("SELECT id, record_type, neighborhood, city, timestamp FROM OfflineQueue WHERE user_id = ? ORDER BY timestamp ASC", (current_user_id,))
+            rows = scur.fetchall()
+            migrated = 0
+            for r in rows:
+                scur.execute(
+                    "INSERT INTO TimeRecords (user_id, record_type, neighborhood, city, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (current_user_id, rf(r, 'record_type'), rf(r, 'neighborhood'), rf(r, 'city'), rf(r, 'timestamp'))
+                )
+                scur.execute("DELETE FROM OfflineQueue WHERE id = ?", (rf(r, 'id'),))
+                migrated += 1
+            sconn.commit()
+            sconn.close()
+            return jsonify({'message': 'Sincronização simulada (local)', 'migrated': migrated, 'errors': []}), 200
+        except Exception as e:
+            return jsonify({'message': f'Falha ao simular sincronização: {str(e)}'}), 500
+    if not (forced or sql_online()):
+        return jsonify({'message': 'Servidor indisponível'}), 503
+    try:
+        import pyodbc
+        drivers = [d for d in pyodbc.drivers() if 'SQL Server' in d]
+        driver = drivers[0] if drivers else 'ODBC Driver 17 for SQL Server'
+        conn_str = f'DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={password};TrustServerCertificate=yes'
+        sqlconn = pyodbc.connect(conn_str)
+        cur = sqlconn.cursor()
+    except Exception as e:
+        return jsonify({'message': 'Driver ODBC ausente ou conexão inválida. Instale unixODBC e o driver MS SQL ou configure a conexão. Detalhe: ' + str(e)}), 500
+    # ensure required tables exist in SQL Server
+    try:
+        cur.execute("IF OBJECT_ID('dbo.Users','U') IS NULL BEGIN CREATE TABLE dbo.Users (id INT IDENTITY(1,1) PRIMARY KEY, matricula NVARCHAR(100) UNIQUE NOT NULL, password NVARCHAR(255) NOT NULL, name NVARCHAR(255) NOT NULL, role NVARCHAR(50) DEFAULT 'user') END")
+        cur.execute("IF OBJECT_ID('dbo.TimeRecords','U') IS NULL BEGIN CREATE TABLE dbo.TimeRecords (id INT IDENTITY(1,1) PRIMARY KEY, user_id INT, matricula NVARCHAR(100) NULL, user_name NVARCHAR(255) NULL, record_type NVARCHAR(100) NOT NULL, timestamp DATETIME2, neighborhood NVARCHAR(255) NULL, city NVARCHAR(255) NULL) END")
+        sqlconn.commit()
+    except Exception:
+        pass
+    # fetch denormalized user fields if available
+    user_matricula = None
+    user_name = None
+    try:
+        cur.execute("SELECT matricula, name FROM Users WHERE id = ?", (current_user_id,))
+        row = cur.fetchone()
+        if row:
+            try:
+                user_matricula = row[0]
+                user_name = row[1]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    sconn = sqlite3.connect(sqlite_path)
+    sconn.row_factory = sqlite3.Row
+    ensure_sqlite_schema(sconn)
+    scur = sconn.cursor()
+    scur.execute("SELECT id, record_type, neighborhood, city, timestamp FROM OfflineQueue WHERE user_id = ? ORDER BY timestamp ASC", (current_user_id,))
+    rows = scur.fetchall()
+    migrated = 0
+    errs = []
+    for r in rows:
+        try:
+            ts_val = rf(r, 'timestamp')
+            try:
+                import datetime as _dt
+                if isinstance(ts_val, str):
+                    try:
+                        ts_val = _dt.datetime.fromisoformat(ts_val)
+                    except Exception:
+                        try:
+                            ts_val = _dt.datetime.strptime(ts_val, "%Y-%m-%d %H:%M:%S.%f")
+                        except Exception:
+                            ts_val = _dt.datetime.strptime(ts_val, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+            # try full insert with denormalized fields if table supports
+            try:
+                cur.execute(
+                    "INSERT INTO TimeRecords (user_id, matricula, user_name, record_type, neighborhood, city, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (current_user_id, user_matricula, user_name, rf(r, 'record_type'), rf(r, 'neighborhood'), rf(r, 'city'), ts_val)
+                )
+            except Exception:
+                cur.execute(
+                    "INSERT INTO TimeRecords (user_id, record_type, neighborhood, city, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (current_user_id, rf(r, 'record_type'), rf(r, 'neighborhood'), rf(r, 'city'), ts_val)
+                )
+            sqlconn.commit()
+            scur.execute("DELETE FROM OfflineQueue WHERE id = ?", (rf(r, 'id'),))
+            sconn.commit()
+            migrated += 1
+        except Exception as e:
+            try:
+                errs.append(str(e))
+            except Exception:
+                pass
+    # migrate legacy sqlite TimeRecords not present in SQL Server
+    try:
+        scur.execute("SELECT id, record_type, neighborhood, city, timestamp FROM TimeRecords WHERE user_id = ? ORDER BY timestamp ASC", (current_user_id,))
+        for r in scur.fetchall():
+            ts = rf(r, 'timestamp')
+            try:
+                cur.execute("SELECT COUNT(*) FROM TimeRecords WHERE user_id = ? AND record_type = ? AND timestamp = ?", (current_user_id, rf(r, 'record_type'), ts))
+                exists = cur.fetchone()[0] > 0
+            except Exception:
+                exists = False
+            if not exists:
+                try:
+                    ts_use = ts
+                    try:
+                        import datetime as _dt
+                        if isinstance(ts_use, str):
+                            try:
+                                ts_use = _dt.datetime.fromisoformat(ts_use)
+                            except Exception:
+                                try:
+                                    ts_use = _dt.datetime.strptime(ts_use, "%Y-%m-%d %H:%M:%S.%f")
+                                except Exception:
+                                    ts_use = _dt.datetime.strptime(ts_use, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute(
+                            "INSERT INTO TimeRecords (user_id, matricula, user_name, record_type, neighborhood, city, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (current_user_id, user_matricula, user_name, rf(r, 'record_type'), rf(r, 'neighborhood'), rf(r, 'city'), ts_use)
+                        )
+                    except Exception:
+                        cur.execute(
+                            "INSERT INTO TimeRecords (user_id, record_type, neighborhood, city, timestamp) VALUES (?, ?, ?, ?, ?)",
+                            (current_user_id, rf(r, 'record_type'), rf(r, 'neighborhood'), rf(r, 'city'), ts_use)
+                        )
+                    sqlconn.commit()
+                    migrated += 1
+                except Exception as e:
+                    try:
+                        errs.append(str(e))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    # mirror Users from SQL Server into local sqlite for offline login
+    try:
+        cur.execute("SELECT matricula, password, name, role FROM Users")
+        all_users = cur.fetchall()
+        for u in all_users:
+            try:
+                scur.execute(
+                    "INSERT OR IGNORE INTO Users (matricula, password, name, role) VALUES (?, ?, ?, ?)",
+                    (u[0], u[1], u[2], u[3])
+                )
+            except Exception:
+                pass
+        sconn.commit()
+    except Exception:
+        pass
+    sqlconn.close()
+    sconn.close()
+    return jsonify({'message': 'Sincronização concluída', 'migrated': migrated, 'errors': errs}), 200
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', '5000'))
+    ensure_default_admin()
+    app.run(host='0.0.0.0', debug=True, port=port)

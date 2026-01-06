@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Ponto Eletrônico - SRE CARAPINA</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .btn-punch {
+            height: 100px;
+            font-size: 1.1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        @media (max-width: 768px) {
+            .btn-punch {
+                height: 80px;
+                font-size: 0.9rem;
+            }
+
+            .navbar-brand {
+                font-size: 1rem;
+            }
+        }
+    </style>
+</head>
+
+<body class="bg-light">
+
+    <nav class="navbar navbar-dark bg-primary mb-4">
+        <div class="container">
+            <span class="navbar-brand mb-0 h1">Ponto Eletrônico - SRE CARAPINA</span>
+            <div class="d-flex align-items-center">
+                <span id="apiUrlDisplay" class="text-white-50 me-3 small" style="font-size: 0.7rem;"></span>
+                <span id="connStatus" class="badge bg-secondary me-3">Offline</span>
+                <span class="text-white me-3" id="userName">User</span>
+                <button class="btn btn-outline-light btn-sm" onclick="logout()">Sair</button>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div class="row mb-4">
+            <div class="col-md-12">
+                <div class="card shadow">
+                    <div class="card-body text-center">
+                        <h4 class="mb-3">Registrar Ponto</h4>
+                        <div id="locationStatus" class="alert alert-warning">Obtendo localização...</div>
+                        <div class="row g-2 mt-2">
+                            <div class="col-12 col-md-5">
+                                <input type="text" class="form-control" id="locNeighborhood" placeholder="Bairro"
+                                    disabled>
+                            </div>
+                            <div class="col-12 col-md-5">
+                                <input type="text" class="form-control" id="locCity" placeholder="Cidade" disabled>
+                            </div>
+                            <div class="col-12 col-md-2 d-grid">
+                                <button id="editLocBtn" class="btn btn-outline-secondary">Editar</button>
+                            </div>
+                        </div>
+                        <div class="row g-2 mt-3">
+                            <div class="col-6 col-md-3 d-grid">
+                                <button class="btn btn-success btn-punch" onclick="registerPunch('Entrada')">☀️
+                                    Entrada</button>
+                            </div>
+                            <div class="col-6 col-md-3 d-grid">
+                                <button class="btn btn-warning btn-punch" onclick="registerPunch('Saída Almoço')">🍽️
+                                    Almoço</button>
+                            </div>
+                            <div class="col-6 col-md-3 d-grid">
+                                <button class="btn btn-info btn-punch" onclick="registerPunch('Volta Almoço')">☕
+                                    Volta</button>
+                            </div>
+                            <div class="col-6 col-md-3 d-grid">
+                                <button class="btn btn-danger btn-punch" onclick="registerPunch('Saída')">🏠
+                                    Saída</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="col-md-12">
+                <div class="card shadow">
+                    <div class="card-header">Meus Registros</div>
+                    <div class="card-body">
+                        <div class="row g-3 align-items-end mb-3">
+                            <div class="col-md-4">
+                                <label class="form-label">Início</label>
+                                <input type="date" class="form-control" id="startDate">
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label">Fim</label>
+                                <input type="date" class="form-control" id="endDate">
+                            </div>
+                            <div class="col-md-4">
+                                <div class="d-grid gap-2">
+                                    <button class="btn btn-secondary" onclick="downloadMyReport()">Baixar Excel
+                                        (Filtro)</button>
+                                    <button id="syncBtn" class="btn btn-primary" onclick="syncNow()">Sincronizar
+                                        agora</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-striped">
+                                <thead>
+                                    <tr>
+                                        <th>Tipo</th>
+                                        <th>Data/Hora</th>
+                                        <th>Bairro</th>
+                                        <th>Cidade</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="historyTable"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="config.js"></script>
+    <script>
+        let currentLocation = { neighborhood: null, city: null, accuracy: null };
+        let locationReady = false;
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const token = localStorage.getItem('token');
+            if (!token) window.location.href = 'index.html';
+            document.getElementById('userName').innerText = localStorage.getItem('name');
+            initGeolocation();
+            loadHistory();
+            loadStatus();
+            checkEndOfMonth();
+            setInterval(loadStatus, 10000);
+        });
+
+        function initGeolocation() {
+            if ("geolocation" in navigator) {
+                navigator.geolocation.getCurrentPosition(async (position) => {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    currentLocation.accuracy = position.coords.accuracy;
+                    document.getElementById('locationStatus').innerText = "Localização obtida. Processando endereço...";
+                    document.getElementById('locationStatus').className = "alert alert-info";
+                    try {
+                        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`, {
+                            headers: { 'User-Agent': 'PontoEletronicoApp/1.0' }
+                        });
+                        const data = await response.json();
+                        const address = data.address;
+                        currentLocation.city = address.city || address.town || address.village || address.municipality;
+                        currentLocation.neighborhood = address.suburb || address.neighbourhood || address.residential || "Desconhecido";
+                        document.getElementById('locationStatus').innerText = `Localização: ${currentLocation.neighborhood}, ${currentLocation.city}${currentLocation.accuracy ? ` (±${Math.round(currentLocation.accuracy)}m)` : ''}`;
+                        document.getElementById('locationStatus').className = "alert alert-success";
+                        document.getElementById('locNeighborhood').value = currentLocation.neighborhood || '';
+                        document.getElementById('locCity').value = currentLocation.city || '';
+                        locationReady = true;
+                    } catch (error) {
+                        try {
+                            const alt = await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=pt`);
+                            const js = await alt.json();
+                            currentLocation.city = js.city || js.locality || js.principalSubdivision || js.countryName;
+                            currentLocation.neighborhood = js.locality || (js.localityInfo && js.localityInfo.administrative && js.localityInfo.administrative[0] && js.localityInfo.administrative[0].name) || "Desconhecido";
+                            document.getElementById('locationStatus').innerText = `Localização: ${currentLocation.neighborhood}, ${currentLocation.city}${currentLocation.accuracy ? ` (±${Math.round(currentLocation.accuracy)}m)` : ''}`;
+                            document.getElementById('locationStatus').className = "alert alert-success";
+                            document.getElementById('locNeighborhood').value = currentLocation.neighborhood || '';
+                            document.getElementById('locCity').value = currentLocation.city || '';
+                            locationReady = true;
+                        } catch (e2) {
+                            document.getElementById('locationStatus').innerText = "Erro ao obter endereço do GPS.";
+                            document.getElementById('locationStatus').className = "alert alert-danger";
+                        }
+                    }
+                }, () => {
+                    document.getElementById('locationStatus').innerText = "Permissão de localização negada. O registro de ponto requer localização.";
+                    document.getElementById('locationStatus').className = "alert alert-danger";
+                });
+            } else {
+                alert("Geolocalização não suportada neste navegador.");
+            }
+        }
+        document.getElementById('editLocBtn').addEventListener('click', () => {
+            const n = document.getElementById('locNeighborhood');
+            const c = document.getElementById('locCity');
+            const editing = n.disabled;
+
+            if (editing) {
+                // Prompt for password when trying to enable editing
+                const pass = window.prompt("Digite a senha de administrador para editar a localização:");
+                if (pass !== "admin123") {
+                    alert("Senha incorreta. A edição não foi permitida.");
+                    return;
+                }
+
+                n.disabled = false;
+                c.disabled = false;
+                document.getElementById('editLocBtn').innerText = 'Salvar';
+                document.getElementById('editLocBtn').className = 'btn btn-primary';
+            } else {
+                // Saving the manual changes
+                n.disabled = true;
+                c.disabled = true;
+                document.getElementById('editLocBtn').innerText = 'Editar';
+                document.getElementById('editLocBtn').className = 'btn btn-outline-secondary';
+
+                currentLocation.neighborhood = n.value || currentLocation.neighborhood;
+                currentLocation.city = c.value || currentLocation.city;
+                document.getElementById('locationStatus').innerText = `Localização: ${currentLocation.neighborhood}, ${currentLocation.city}${currentLocation.accuracy ? ` (±${Math.round(currentLocation.accuracy)}m)` : ''}`;
+            }
+        });
+
+        async function registerPunch(type) {
+            if (!locationReady) {
+                alert("Aguarde a localização ou verifique as permissões.");
+                return;
+            }
+            const token = localStorage.getItem('token');
+            try {
+                if (window.API_READY) await window.API_READY;
+                const response = await apiFetch(`/api/punch`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({ type, neighborhood: document.getElementById('locNeighborhood').value || currentLocation.neighborhood, city: document.getElementById('locCity').value || currentLocation.city })
+                });
+                if (response.ok) {
+                    alert("Ponto registrado com sucesso!");
+                    loadHistory();
+                } else {
+                    alert("Erro ao registrar ponto.");
+                }
+            } catch (error) {
+                const r = offline.punchAdd(type, document.getElementById('locNeighborhood').value || currentLocation.neighborhood, document.getElementById('locCity').value || currentLocation.city);
+                if (r && r.ok) {
+                    alert("Ponto registrado offline. Será sincronizado quando online.");
+                    loadHistory();
+                } else {
+                    alert("Erro de conexão.");
+                }
+            }
+        }
+
+        async function loadHistory() {
+            const token = localStorage.getItem('token');
+            try {
+                if (window.API_READY) await window.API_READY;
+                const response = await apiFetch(`/api/history`, { headers: { 'Authorization': `Bearer ${token}` } });
+                const records = await response.json();
+                const tbody = document.getElementById('historyTable');
+                tbody.innerHTML = '';
+                records.forEach(r => {
+                    const pendingBadge = r.pending ? `<span class="badge bg-warning text-dark ms-2">pendente</span>` : '';
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `<td>${r.type}${pendingBadge}</td><td>${r.timestamp}</td><td>${r.neighborhood || '-'}</td><td>${r.city || '-'}</td>`;
+                    tbody.appendChild(tr);
+                });
+            } catch (error) {
+                const records = offline.history();
+                const tbody = document.getElementById('historyTable');
+                tbody.innerHTML = '';
+                records.forEach(r => {
+                    const pendingBadge = r.pending ? `<span class="badge bg-warning text-dark ms-2">pendente</span>` : '';
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `<td>${r.type}${pendingBadge}</td><td>${r.timestamp}</td><td>${r.neighborhood || '-'}</td><td>${r.city || '-'}</td>`;
+                    tbody.appendChild(tr);
+                });
+            }
+        }
+
+        let isOnline = false;
+        let firstLoad = true;
+
+        async function loadStatus() {
+            try {
+                if (window.API_READY) await window.API_READY;
+                const apiBase = window.API_BASE_URL || 'detectando...';
+                document.getElementById('apiUrlDisplay').innerText = apiBase;
+
+                const res = await apiFetch(`/api/online`);
+                const js = await res.json();
+                const badge = document.getElementById('connStatus');
+
+                const currentlyOnline = js.online && js.db_online;
+
+                if (currentlyOnline) {
+                    badge.className = 'badge bg-success me-3';
+                    badge.innerText = 'Online';
+
+                    // Auto-sync transition: Offline -> Online OR First Load
+                    if (!isOnline) {
+                        console.log("Connection verified/restored. Auto-syncing...");
+                        syncNow(true); // Silent mode
+                    }
+                    isOnline = true;
+                } else {
+                    badge.className = 'badge bg-secondary me-3';
+                    badge.innerText = 'Offline';
+                    isOnline = false;
+                }
+
+                document.getElementById('syncBtn').disabled = false;
+
+                // Update pending count if offline
+                if (!currentlyOnline) {
+                    checkPendingCount();
+                }
+
+                firstLoad = false;
+            } catch (e) {
+                const apiBase = window.API_BASE_URL || 'falha';
+                document.getElementById('apiUrlDisplay').innerText = apiBase;
+                const badge = document.getElementById('connStatus');
+                badge.className = 'badge bg-danger me-3';
+                badge.innerText = 'Offline'; // Changed from 'Sem Conexão' to reduce confusion
+                isOnline = false;
+                document.getElementById('syncBtn').disabled = false; // Always allow retry
+            }
+        }
+
+        async function checkPendingCount() {
+            // Optional: update UI with number of pending items
+            // This would require exposing existing offline queue length
+            // For now, we rely on the table rendering "pendente" badges
+        }
+
+        function initApiUi() {
+            // Removido conforme solicitado
+        }
+
+        async function syncNow(isSilent = false) {
+            const token = localStorage.getItem('token');
+            let msg = '';
+            let serverSuccess = false;
+            let totalMigrated = 0;
+
+            // 1. Server-Side Sync (SQL <-> SQLite)
+            try {
+                if (window.API_READY) await window.API_READY;
+                const res = await apiFetch(`/api/sync`, { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } });
+                const js = await res.json();
+                if (res.ok) {
+                    serverSuccess = true;
+                    totalMigrated += (js.migrated || 0);
+                    if (!isSilent) msg += (js.message || 'Sincronização com servidor OK') + '\n';
+                } else if (!isSilent) {
+                    msg += 'Erro no servidor: ' + (js.message || res.statusText) + '\n';
+                }
+            } catch (e) {
+                if (!isSilent) msg += 'Servidor indisponível para sincronização.\n';
+            }
+
+            // 2. Client-Side Sync (Browser -> Backend)
+            try {
+                if (window.offline && window.offline.sync) {
+                    const r = await offline.sync(token);
+                    totalMigrated += r.migrated;
+                    if (!isSilent && r.migrated > 0) {
+                        msg += `Enviados do navegador: ${r.migrated} registros.\n`;
+                    }
+                }
+            } catch (e) { }
+
+            if (isSilent) {
+                if (totalMigrated > 0) {
+                    alert(`Sincronização automática concluída: ${totalMigrated} registros enviados.`);
+                }
+            } else {
+                if (!msg) msg = 'Nenhum dado pendente ou erro desconhecido.';
+                alert(msg);
+            }
+            loadHistory();
+            loadStatus();
+        }
+
+
+        async function downloadMyReport() {
+            const token = localStorage.getItem('token');
+            const s = document.getElementById('startDate').value;
+            const e = document.getElementById('endDate').value;
+            let url = `/api/user/report`;
+            const params = [];
+            if (s) params.push(`start_date=${s}`);
+            if (e) params.push(`end_date=${e}`);
+            if (params.length) url += `?${params.join('&')}`;
+            try {
+                if (window.API_READY) await window.API_READY;
+                const response = await apiFetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const downloadUrl = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = downloadUrl;
+                    a.download = 'meus_registros.xlsx';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                } else {
+                    alert('Erro ao gerar Excel.');
+                }
+            } catch (err) {
+                alert('Erro de conexão.');
+            }
+        }
+
+        function logout() {
+            localStorage.clear();
+            window.location.href = 'index.html';
+        }
+
+        function checkEndOfMonth() {
+            const today = new Date();
+            const tomorrow = new Date(today);
+            tomorrow.setDate(today.getDate() + 1);
+
+            // If the month of tomorrow is different from today, it means today is the last day of the month
+            if (today.getMonth() !== tomorrow.getMonth()) {
+                // Check if we already showed the alert today to avoid spamming on reload (optional, but good UX)
+                // For now, per requirements: "um alerta aparece para o usuario" - we'll just show it.
+                // Using a bootstrap modal would be nicer, but standard alert is safer/simpler for now unless requested otherwise.
+                // However, user mentioned "exportar excel botao que ja existe".
+                if (!sessionStorage.getItem('monthAlertShown')) {
+                    alert("Atenção: Hoje é o último dia do mês.\nPor favor, lembre-se de exportar seus registros clicando em 'Baixar Excel'.\nOs dados serão reiniciados no próximo mês.");
+                    sessionStorage.setItem('monthAlertShown', 'true');
+                }
+            }
+        }
+    </script>
+</body>
+
+</html>

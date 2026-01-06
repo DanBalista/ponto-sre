@@ -1,0 +1,23 @@
+🌍 Configurando Ngrok com o token fornecido...
+🚀 Iniciando Backend Flask...
+DEBUG: Starting local data migration...
+DEBUG: Local data migration complete.
+ * Serving Flask app 'app'
+ * Debug mode: off
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5005
+ * Running on http://192.168.15.9:5005
+[33mPress CTRL+C to quit[0m
+⏳ Abrindo túnel público...
+
+✨ SISTEMA ONLINE: https://nga-postauditory-unharmonically.ngrok-free.dev ✨
+✅ netlify/config.js atualizado com: https://nga-postauditory-unharmonically.ngrok-free.dev
+
+✅ TUDO PRONTO!
+1. O seu site no Netlify usará: https://nga-postauditory-unharmonically.ngrok-free.dev
+2. Agora, basta fazer o upload da pasta 'netlify' uma última vez para o Netlify.
+3. Esté endereço é FIXO enquanto este script estiver rodando.
+
+⚠️ MANTENHA ESTA JANELA ABERTA!
+127.0.0.1 - - [05/Jan/2026 22:36:48] "HEAD / HTTP/1.1" 200 -
